@@ -95,73 +95,54 @@ SETTINGS_DEFAULTS: dict = {
 
 
 # -----------------------------------------------------------------------------
-# State persistence helpers
+# JSON persistence helpers
 # -----------------------------------------------------------------------------
 
-def load_state(target_dir: Path) -> dict | None:
-    """Return persisted state dict, or None if no valid file exists."""
-    path = target_dir / PERSIST_FILENAME
+def _load_json(path: Path, defaults: dict, *, fallback: bool = False) -> dict | None:
+    """Load a JSON file and merge with defaults; return None if file is missing.
+    If fallback is True, return a defaults copy on error instead of None."""
     if not path.exists():
         return None
     try:
         with open(path, encoding='utf-8') as fh:
             saved = json.load(fh)
-        state = DEFAULTS.copy()
-        state.update(saved)          # Saved values win; missing keys get defaults
-        return state
+        result = defaults.copy()
+        result.update(saved)          # Saved values win; missing keys get defaults
+        return result
     except Exception as exc:
-        print(f"Warning: could not read session file ({exc}) - ignoring.")
-        return None
+        suffix = ' - using defaults.' if fallback else ' - ignoring.'
+        print(f"Warning: could not read {path.name} ({exc}){suffix}")
+        return defaults.copy() if fallback else None
+
+
+def _save_json(path: Path, data: dict, label: str) -> None:
+    """Serialize data to path as indented JSON, printing label on success."""
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2)
+        print(f"{label} -> {path}")
+    except Exception as exc:
+        print(f"Warning: could not save {path.name} ({exc})")
+
+
+def load_state(target_dir: Path) -> dict | None:
+    """Return persisted session dict, or None if no valid file exists."""
+    return _load_json(target_dir / PERSIST_FILENAME, DEFAULTS)
 
 
 def save_state(state: dict, target_dir: Path) -> None:
-    """Serialize state to the target directory's persist file."""
-    path = target_dir / PERSIST_FILENAME
-    try:
-        with open(path, 'w', encoding='utf-8') as fh:
-            json.dump(state, fh, indent=2)
-        print(f"Session saved -> {path}")
-    except Exception as exc:
-        print(f"Warning: could not save session ({exc})")
+    """Serialize session state to the target directory's persist file."""
+    _save_json(target_dir / PERSIST_FILENAME, state, "Session saved")
 
-
-# -----------------------------------------------------------------------------
-# Settings persistence
-# -----------------------------------------------------------------------------
 
 def load_settings(target_dir: Path) -> dict | None:
-    """Return settings dict from file, or None if the file does not exist."""
-    path = target_dir / SETTINGS_FILENAME
-    if not path.exists():
-        return None
-    try:
-        with open(path, encoding='utf-8') as fh:
-            saved = json.load(fh)
-        settings = SETTINGS_DEFAULTS.copy()
-        settings.update(saved)      # File wins; unknown keys kept; missing keys default
-        return settings
-    except Exception as exc:
-        print(f"Warning: could not read settings file ({exc}) - using defaults.")
-        return SETTINGS_DEFAULTS.copy()
+    """Return settings dict from file; falls back to defaults on error, None if missing."""
+    return _load_json(target_dir / SETTINGS_FILENAME, SETTINGS_DEFAULTS, fallback=True)
 
 
-def create_settings(target_dir: Path, image_files: list[Path]) -> dict:
-    """
-    Create a settings file with defaults and return the settings dict.
-    Uses the first image (alphabetically) as the start menu background.
-    Called only when no settings file exists in the target directory.
-    """
-    settings = SETTINGS_DEFAULTS.copy()
-    if image_files:
-        settings['start_menu_image'] = image_files[0].name
-    path = target_dir / SETTINGS_FILENAME
-    try:
-        with open(path, 'w', encoding='utf-8') as fh:
-            json.dump(settings, fh, indent=2)
-        print(f"Settings created -> {path}  (edit to customise)")
-    except Exception as exc:
-        print(f"Warning: could not create settings file ({exc})")
-    return settings
+def save_settings(settings: dict, target_dir: Path) -> None:
+    """Write settings dict to the target directory's settings file."""
+    _save_json(target_dir / SETTINGS_FILENAME, settings, "Settings created  (edit to customise)")
 
 
 # -----------------------------------------------------------------------------
@@ -197,8 +178,8 @@ def build_playlist(image_files: list[Path], state: dict) -> list[Path]:
 # -----------------------------------------------------------------------------
 
 def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
-    h = hex_color.lstrip('#')
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    c = pygame.Color(hex_color)
+    return c.r, c.g, c.b
 
 
 def scale_surface(surf: pygame.Surface, screen_w: int, screen_h: int) -> pygame.Surface:
@@ -377,7 +358,7 @@ def draw_overlays(screen: pygame.Surface,
     text_col    = hex_to_rgb(settings.get('label_text_color',    '#ffffff'))
     outline_col = hex_to_rgb(settings.get('label_outline_color', '#000000'))
 
-    if state.get('show_label'):
+    if state['show_label']:
         n = len(playlist)
 
         centre_text = f"{playlist[idx].name}   [{idx + 1}/{n}]"
@@ -397,7 +378,7 @@ def draw_overlays(screen: pygame.Surface,
                                color=text_col, outline_color=outline_col,
                                cx=W - PAD, y=PAD, align='right')
 
-    if state.get('paused'):
+    if state['paused']:
         draw_outlined_text(screen, "Press Space to resume", pause_font,
                            color=(255, 255, 255), outline_color=(0, 0, 0),
                            cx=W // 2, y=H - pause_font.get_height() - PAD,
@@ -405,32 +386,22 @@ def draw_overlays(screen: pygame.Surface,
 
 
 # -----------------------------------------------------------------------------
-# Event polling helpers
+# Event polling
 # -----------------------------------------------------------------------------
 
-def poll_events(state: dict) -> str | None:
-    """
-    Lightweight poller used inside transition renderers.
-    Handles: T (cycle transition), Escape / window-close.
-    Returns 'QUIT' or None.
-    """
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            return 'QUIT'
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                return 'QUIT'
-            if event.key == pygame.K_t:
-                state['transition_mode'] = (state['transition_mode'] + 1) % 3
-                print(f"Transition mode -> {TRANSITION_NAMES[state['transition_mode']]}")
-    return None
+_KEY_SIGNALS: dict[int, str] = {
+    pygame.K_SPACE: 'TOGGLE_PAUSE',
+    pygame.K_l:     'TOGGLE_LABEL',
+    pygame.K_z:     'PREV',
+    pygame.K_x:     'NEXT',
+}
 
 
 def poll_slideshow_events(state: dict) -> str | None:
     """
-    Full event poller used in the slideshow wait / pause phase.
+    Event poller used in the slideshow wait / pause phase and transition renderers.
     Returns one of: 'QUIT' | 'PREV' | 'NEXT' | 'TOGGLE_PAUSE' | 'TOGGLE_LABEL' | None.
-    T is handled here as a side-effect (no separate return value needed).
+    T is handled as a side-effect (no separate return value needed).
     """
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
@@ -441,14 +412,8 @@ def poll_slideshow_events(state: dict) -> str | None:
             elif event.key == pygame.K_t:
                 state['transition_mode'] = (state['transition_mode'] + 1) % 3
                 print(f"Transition mode -> {TRANSITION_NAMES[state['transition_mode']]}")
-            elif event.key == pygame.K_SPACE:
-                return 'TOGGLE_PAUSE'
-            elif event.key == pygame.K_l:
-                return 'TOGGLE_LABEL'
-            elif event.key == pygame.K_z:
-                return 'PREV'
-            elif event.key == pygame.K_x:
-                return 'NEXT'
+            elif signal := _KEY_SIGNALS.get(event.key):
+                return signal
     return None
 
 
@@ -486,7 +451,31 @@ def transition_fade_over(screen: pygame.Surface,
         screen.blit(overlay, (0, 0))
         pygame.display.flip()
         clock.tick(DISPLAY_FPS)
-        if poll_events(state) == 'QUIT':
+        if poll_slideshow_events(state) == 'QUIT':
+            return 'QUIT'
+        if t >= 1.0:
+            return None
+
+
+def _fade_surface(screen: pygame.Surface,
+                  surf: pygame.Surface,
+                  bg_color: tuple,
+                  half: float,
+                  clock: pygame.time.Clock,
+                  state: dict,
+                  *,
+                  fade_in: bool) -> str | None:
+    """Animate surf fading in or out over half seconds; return 'QUIT' if interrupted."""
+    t0 = time.monotonic()
+    while True:
+        t = min((time.monotonic() - t0) / half, 1.0)
+        fading = surf.copy()
+        fading.set_alpha(int(255 * (t if fade_in else 1.0 - t)))
+        screen.fill(bg_color)
+        screen.blit(fading, (0, 0))
+        pygame.display.flip()
+        clock.tick(DISPLAY_FPS)
+        if poll_slideshow_events(state) == 'QUIT':
             return 'QUIT'
         if t >= 1.0:
             return None
@@ -500,38 +489,10 @@ def transition_fade_out_fade_in(screen: pygame.Surface,
                                 bg_color: tuple,
                                 clock: pygame.time.Clock) -> str | None:
     """Fade current image to background, then fade next image in."""
-    duration = max(float(settings['transition_time_fade_out_fade_in']), 0.01)
-    half = duration / 2.0
-
-    # -- Fade out current
-    t0 = time.monotonic()
-    while True:
-        t = min((time.monotonic() - t0) / half, 1.0)
-        fading = curr.copy()
-        fading.set_alpha(int(255 * (1.0 - t)))
-        screen.fill(bg_color)
-        screen.blit(fading, (0, 0))
-        pygame.display.flip()
-        clock.tick(DISPLAY_FPS)
-        if poll_events(state) == 'QUIT':
-            return 'QUIT'
-        if t >= 1.0:
-            break
-
-    # -- Fade in next
-    t0 = time.monotonic()
-    while True:
-        t = min((time.monotonic() - t0) / half, 1.0)
-        fading = nxt.copy()
-        fading.set_alpha(int(255 * t))
-        screen.fill(bg_color)
-        screen.blit(fading, (0, 0))
-        pygame.display.flip()
-        clock.tick(DISPLAY_FPS)
-        if poll_events(state) == 'QUIT':
-            return 'QUIT'
-        if t >= 1.0:
-            return None
+    half = max(float(settings['transition_time_fade_out_fade_in']), 0.01) / 2.0
+    if _fade_surface(screen, curr, bg_color, half, clock, state, fade_in=False) == 'QUIT':
+        return 'QUIT'
+    return _fade_surface(screen, nxt, bg_color, half, clock, state, fade_in=True)
 
 
 TRANSITIONS = {
@@ -838,7 +799,7 @@ def run_slideshow(screen: pygame.Surface,
         pause_start: float | None = None
 
         while True:
-            if not state.get('paused') and time.monotonic() >= display_deadline:
+            if not state['paused'] and time.monotonic() >= display_deadline:
                 break   # Time to advance to the next image
 
             signal = poll_slideshow_events(state)
@@ -848,7 +809,7 @@ def run_slideshow(screen: pygame.Surface,
                 return 'QUIT'
 
             elif signal == 'TOGGLE_PAUSE':
-                state['paused'] = not state.get('paused', False)
+                state['paused'] = not state['paused']
                 if state['paused']:
                     pause_start = time.monotonic()
                     print("Paused.")
@@ -861,14 +822,13 @@ def run_slideshow(screen: pygame.Surface,
                 redraw(current_frame)
 
             elif signal == 'TOGGLE_LABEL':
-                state['show_label'] = not state.get('show_label', False)
+                state['show_label'] = not state['show_label']
                 redraw(current_frame)
 
-            elif signal == 'PREV':
-                # -- Z: step back one image in the playlist (floor: index 0)
-                if idx > 0:
-                    target = idx - 1
-                    frame  = load_frame_sync(playlist[target], screen_sz, bg_color)
+            elif signal in ('PREV', 'NEXT'):
+                target = idx + (-1 if signal == 'PREV' else 1)
+                if 0 <= target < n:
+                    frame = load_frame_sync(playlist[target], screen_sz, bg_color)
                     if frame is not None:
                         idx           = target
                         current_frame = frame
@@ -877,22 +837,6 @@ def run_slideshow(screen: pygame.Surface,
                         loader.start(playlist[next_idx])
                         display_deadline = time.monotonic() + settings['image_delay']
                         redraw(current_frame)
-                # else: already at first image — do nothing
-
-            elif signal == 'NEXT':
-                # -- X: step forward one image in the playlist (ceil: last index)
-                if idx < n - 1:
-                    target = idx + 1
-                    frame  = load_frame_sync(playlist[target], screen_sz, bg_color)
-                    if frame is not None:
-                        idx           = target
-                        current_frame = frame
-                        state['current_image_index'] = idx
-                        next_idx = (idx + 1) % n
-                        loader.start(playlist[next_idx])
-                        display_deadline = time.monotonic() + settings['image_delay']
-                        redraw(current_frame)
-                # else: already at last image — do nothing
 
             clock.tick(WAIT_FPS)
 
@@ -984,10 +928,14 @@ def main() -> None:
 
     persisted = load_state(target_dir)
 
-    # Load settings, creating the file with defaults on first run.
+    # Load settings; on first run build defaults, pick the first image as the
+    # start-menu background, then write the file so the user can edit it.
     settings = load_settings(target_dir)
     if settings is None:
-        settings = create_settings(target_dir, image_files)
+        settings = SETTINGS_DEFAULTS.copy()
+        if image_files:
+            settings['start_menu_image'] = image_files[0].name
+        save_settings(settings, target_dir)
 
     # -- Pygame initialisation
     pygame.init()
