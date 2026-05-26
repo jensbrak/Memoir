@@ -48,7 +48,7 @@ except ImportError:
 # -----------------------------------------------------------------------------
 
 SUPPORTED_EXTENSIONS  = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.webp'}
-PERSIST_FILENAME      = '.memoir_session.json'
+SESSION_FILENAME      = '.memoir_session.json'
 SETTINGS_FILENAME     = '.memoir_settings.json'
 MAX_CONSECUTIVE_FAILS = 5     # Abort after this many back-to-back load failures
 DISPLAY_FPS           = 60    # Frame-rate during animated transitions
@@ -65,10 +65,10 @@ TEXT_OUTLINE_PX = 2
 
 
 # -----------------------------------------------------------------------------
-# Default persisted state  (session — reset on S/R; loaded on L)
+# Default session state  (reset on S/R; restored on L)
 # -----------------------------------------------------------------------------
 
-DEFAULTS: dict = {
+SESSION_DEFAULTS: dict = {
     'random_order':        False,
     'transition_mode':     1,       # 0=Direct 1=Fade-over 2=Fade-out/in
     'current_image_index': 0,
@@ -125,14 +125,14 @@ def _save_json(path: Path, data: dict, label: str) -> None:
         print(f"Warning: could not save {path.name} ({exc})")
 
 
-def load_state(target_dir: Path) -> dict | None:
-    """Return persisted session dict, or None if no valid file exists."""
-    return _load_json(target_dir / PERSIST_FILENAME, DEFAULTS)
+def load_session(target_dir: Path) -> dict | None:
+    """Return saved session dict, or None if no session file exists."""
+    return _load_json(target_dir / SESSION_FILENAME, SESSION_DEFAULTS)
 
 
-def save_state(state: dict, target_dir: Path) -> None:
-    """Serialize session state to the target directory's persist file."""
-    _save_json(target_dir / PERSIST_FILENAME, state, "Session saved")
+def save_session(state: dict, target_dir: Path) -> None:
+    """Serialize session state to the target directory's session file."""
+    _save_json(target_dir / SESSION_FILENAME, state, "Session saved")
 
 
 def load_settings(target_dir: Path) -> dict | None:
@@ -218,10 +218,9 @@ def make_frame(surf: pygame.Surface,
 def load_raw(path: Path) -> pygame.Surface:
     """
     Load an image from disk without display-format conversion (thread-safe).
-    If Pillow is available, EXIF orientation is applied before handing the
-    surface to pygame so rotated photos appear correctly.
-    Falls back to a plain pygame load if EXIF correction fails for any reason,
-    printing a warning to the console.
+    If Pillow is available, the full PIL pipeline runs: open, EXIF correction
+    (no-op for normally-oriented images), RGB conversion, and buffer load.
+    Falls back to a plain pygame load if any step fails, with a warning.
     """
     if _PIL_AVAILABLE:
         try:
@@ -233,8 +232,8 @@ def load_raw(path: Path) -> pygame.Surface:
             buf.seek(0)
             return pygame.image.load(buf, 'img.png')
         except Exception as exc:
-            print(f"Warning: EXIF rotation failed for '{path.name}' ({exc})"
-                  f" - showing unrotated.")
+            print(f"Warning: PIL processing failed for '{path.name}' ({exc})"
+                  f" - loading without EXIF correction.")
     return pygame.image.load(str(path))
 
 
@@ -411,7 +410,7 @@ def poll_slideshow_events(state: dict) -> str | None:
                 return 'QUIT'
             elif event.key == pygame.K_t:
                 state['transition_mode'] = (state['transition_mode'] + 1) % 3
-                print(f"Transition mode -> {TRANSITION_NAMES[state['transition_mode']]}")
+                print(f"Transition: {TRANSITION_NAMES[state['transition_mode']]}")
             elif signal := _KEY_SIGNALS.get(event.key):
                 return signal
     return None
@@ -516,6 +515,8 @@ def pick_display() -> int | None:
     """
     num = pygame.display.get_num_displays()
     if num <= 1:
+        w, h = pygame.display.get_desktop_sizes()[0]
+        print(f"Display 1 ({w}x{h}) - only display detected.")
         return 0
 
     sizes   = pygame.display.get_desktop_sizes()   # list of (w, h), one per display
@@ -584,7 +585,7 @@ def pick_display() -> int | None:
 # -----------------------------------------------------------------------------
 
 def show_start_menu(screen: pygame.Surface,
-                    has_persisted: bool,
+                    has_saved_session: bool,
                     settings: dict,
                     target_dir: Path) -> str:
     """
@@ -620,7 +621,7 @@ def show_start_menu(screen: pygame.Surface,
         ("[S]", "  Sequential order"),
         ("[R]", "  Random order"),
     ]
-    if has_persisted:
+    if has_saved_session:
         key_lines.append(("[L]", "  Load previous session"))
 
     # Pre-render to measure widths for block-centering
@@ -637,8 +638,8 @@ def show_start_menu(screen: pygame.Surface,
 
     title_surf = font_title.render(settings.get('start_menu_title', 'MEMOIR'),
                                    True, (255, 255, 255))
-    note_text  = ("Pressing S or R will reset the persisted session."
-                  if has_persisted else "")
+    note_text  = ("Pressing S or R will start a new session."
+                  if has_saved_session else "")
     note_surf  = font_note.render(note_text, True, MUTED) if note_text else None
 
     # -- Panel geometry
@@ -702,7 +703,7 @@ def show_start_menu(screen: pygame.Surface,
 
     # -- Event loop
     valid = {pygame.K_r: 'R', pygame.K_s: 'S'}
-    if has_persisted:
+    if has_saved_session:
         valid[pygame.K_l] = 'L'
 
     while True:
@@ -728,7 +729,7 @@ def load_frame_sync(path: Path,
     try:
         return prepare_frame(load_raw(path), screen_sz, bg_color)
     except Exception as exc:
-        print(f"Could not load '{path.name}': {exc}")
+        print(f"Warning: could not load '{path.name}': {exc}")
         return None
 
 
@@ -773,7 +774,7 @@ def run_slideshow(screen: pygame.Surface,
             current_frame = prepare_frame(raw, screen_sz, bg_color)
             consec = 0
         except Exception as exc:
-            print(f"Skipping '{playlist[idx].name}': {exc}")
+            print(f"Warning: skipping '{playlist[idx].name}': {exc}")
             consec += 1
             if consec >= MAX_CONSECUTIVE_FAILS:
                 print(f"Fatal: {MAX_CONSECUTIVE_FAILS} consecutive load failures at startup.")
@@ -785,6 +786,9 @@ def run_slideshow(screen: pygame.Surface,
 
     state['current_image_index'] = idx
     redraw(current_frame)
+    print(f"[{idx + 1}/{n}] {playlist[idx].name}")
+    if state['paused']:
+        print("Paused.")
 
     # Kick off background pre-load for the next image
     next_idx = (idx + 1) % n
@@ -837,6 +841,9 @@ def run_slideshow(screen: pygame.Surface,
                         loader.start(playlist[next_idx])
                         display_deadline = time.monotonic() + settings['image_delay']
                         redraw(current_frame)
+                        print(f"[{idx + 1}/{n}] {playlist[idx].name}")
+                else:
+                    print("At first image." if signal == 'PREV' else "At last image.")
 
             clock.tick(WAIT_FPS)
 
@@ -859,7 +866,7 @@ def run_slideshow(screen: pygame.Surface,
                 consec = 0
 
             except Exception as exc:
-                print(f"Skipping '{playlist[candidate].name}': {exc}")
+                print(f"Warning: skipping '{playlist[candidate].name}': {exc}")
                 consec += 1
                 first_attempt = False
                 if consec >= MAX_CONSECUTIVE_FAILS:
@@ -888,8 +895,11 @@ def run_slideshow(screen: pygame.Surface,
 
         # Re-draw overlays on the freshly displayed frame
         redraw(current_frame)
+        print(f"[{idx + 1}/{n}] {playlist[idx].name}")
 
         next_idx = (idx + 1) % n
+        if next_idx == 0 and n > 1:
+            print("Playlist complete - looping.")
         loader.start(playlist[next_idx])
         display_deadline = time.monotonic() + settings['image_delay']
 
@@ -926,7 +936,7 @@ def main() -> None:
 
     print(f"Found {len(image_files)} image(s) in '{target_dir}'.")
 
-    persisted = load_state(target_dir)
+    saved_session = load_session(target_dir)
 
     # Load settings; on first run build defaults, pick the first image as the
     # start-menu background, then write the file so the user can edit it.
@@ -945,6 +955,9 @@ def main() -> None:
         pygame.quit()
         return   # User cancelled the display picker
 
+    disp_w, disp_h = pygame.display.get_desktop_sizes()[display_idx]
+    print(f"Display {display_idx + 1} ({disp_w}x{disp_h}).")
+
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN, display=display_idx)
     pygame.display.set_caption("Memoir")
     pygame.mouse.set_visible(False)
@@ -954,7 +967,7 @@ def main() -> None:
 
     try:
         choice = show_start_menu(screen,
-                                 has_persisted=persisted is not None,
+                                 has_saved_session=saved_session is not None,
                                  settings=settings,
                                  target_dir=target_dir)
 
@@ -962,17 +975,25 @@ def main() -> None:
             return
 
         # Build session state
-        if choice == 'L' and persisted is not None:
-            state = persisted
-            print(f"Resumed session - image index {state['current_image_index']}, "
-                  f"mode {'random' if state['random_order'] else 'sequential'}.")
+        if choice == 'L' and saved_session is not None:
+            state = saved_session
+            print(f"Resumed session: image {state['current_image_index'] + 1}, "
+                  f"{'random' if state['random_order'] else 'sequential'}, "
+                  f"transition: {TRANSITION_NAMES[state['transition_mode']]}.")
         else:
-            state = DEFAULTS.copy()
+            state = SESSION_DEFAULTS.copy()
             state['random_order'] = (choice == 'R')
 
         playlist = build_playlist(image_files, state)
 
-        run_slideshow(screen, playlist, state, settings)
+        if choice != 'L':
+            mode = 'random' if state['random_order'] else 'sequential'
+            print(f"Starting slideshow: {len(playlist)} images, {mode}, "
+                  f"{settings['image_delay']}s per image, "
+                  f"transition: {TRANSITION_NAMES[state['transition_mode']]}.")
+
+        if run_slideshow(screen, playlist, state, settings) == 'ERROR':
+            exit_code = 1
 
     except Exception as exc:
         print(f"Unrecoverable error: {exc}")
@@ -984,7 +1005,7 @@ def main() -> None:
         # regardless of whether it exited cleanly, hit an error, or crashed.
         # This ensures the L option always appears on the next run.
         if state is not None:
-            save_state(state, target_dir)
+            save_session(state, target_dir)
         pygame.mouse.set_visible(True)
         pygame.quit()
 
