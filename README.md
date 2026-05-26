@@ -4,7 +4,7 @@ A single-file Python slideshow — simple enough for a party, reliable enough to
 
 - Pause, step back, and skip forward at any time — controls built for group viewing as much as set-and-forget
 - Exits cleanly and resumes exactly where it left off — random order included, with the same seeded shuffle restored
-- Multi-display support with an interactive picker when more than one screen is connected
+- Multi-display support with an interactive picker; `--display N` selects a display directly for unattended startup
 - Three transition modes switchable at runtime (direct cut, fade-over, fade-out/in)
 - Config written on first run and never overwritten — safe to deploy and customize
 
@@ -14,17 +14,26 @@ The folder is the playlist — every image in it, in filename order or shuffled.
 
 - Python 3.10+
 - [pygame](https://www.pygame.org/) — `pip install pygame`
-- [Pillow](https://python-pillow.org/) *(optional, enables EXIF auto-rotation)* — `pip install pillow`
+- [Pillow](https://python-pillow.org/) *(optional, enables EXIF correction)* — `pip install pillow`
 
 ## Usage
 
 ```
-python memoir.py <imagedir>
+python memoir.py <imagedir> [options]
 ```
 
 Supports JPG, PNG, BMP, GIF, TIFF, and WebP. Memoir opens fullscreen and loops until you quit.
 
-Controls and keyboard shortcuts are documented in the script's opening docstring.
+Key options:
+
+- `--order sequential|random` — start in the given order, skipping the start menu
+- `--continue` — continue a previously saved session, skipping the start menu
+- `--display N` — use display N (1-based), skipping the display picker
+- `--delay SECONDS` — override image duration
+- `--transition direct|fade-over|fade-out-in` — override transition style
+- `--windowed` — run as a borderless window instead of exclusive fullscreen
+
+Run `python memoir.py --help` for the full flag reference. In-slideshow controls are listed in the script's opening docstring.
 
 ## Configuration
 

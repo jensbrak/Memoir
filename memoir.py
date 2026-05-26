@@ -3,16 +3,24 @@
 memoir.py - Fullscreen image slideshow with fade transitions and session persistence.
 
 Usage:
-    python memoir.py <directory>
+    python memoir.py <directory> [options]
+
+Options:
+    --order sequential|random                  Start in the given order, skipping the start menu
+    --continue                                 Continue a previously saved session, skipping the start menu
+    --display N                                Display number to use, 1-based (skips the display picker)
+    --delay SECONDS                            Image duration in seconds (overrides settings file)
+    --transition direct|fade-over|fade-out-in  Transition style (overrides settings file)
+    --windowed                                 Run as a borderless window instead of exclusive fullscreen
 
 Dependencies:
     pip install pygame
-    pip install pillow   # optional - enables EXIF auto-rotation
+    pip install pillow   # optional - enables EXIF correction
 
 Controls (start menu):
     S          - Start slideshow in sequential order
     R          - Start slideshow in random order
-    L          - Load previous session  (if available)
+    C          - Continue session  (if available)
 
 Controls (slideshow):
     Space      - Pause / Resume
@@ -20,9 +28,10 @@ Controls (slideshow):
     L          - Toggle filename / count label
     Z          - Jump to previously shown image (no transition; does nothing on first)
     X          - Jump to next image (no transition; does nothing on last)
-    Escape     - Exit (state is saved)
+    Escape     - Exit (session is saved)
 """
 
+import argparse
 import os
 import sys
 import json
@@ -54,7 +63,13 @@ MAX_CONSECUTIVE_FAILS = 5     # Abort after this many back-to-back load failures
 DISPLAY_FPS           = 60    # Frame-rate during animated transitions
 WAIT_FPS              = 30    # Frame-rate while an image is simply being displayed
 
-TRANSITION_NAMES = {0: 'Direct', 1: 'Fade-over', 2: 'Fade-out / Fade-in'}
+_TRANSITION_TABLE = [
+    ('direct',      'Direct'),
+    ('fade-over',   'Fade-over'),
+    ('fade-out-in', 'Fade-out / Fade-in'),
+]
+TRANSITION_NAMES = {i: name for i, (_, name) in enumerate(_TRANSITION_TABLE)}
+TRANSITION_CLI   = {cli: i  for i, (cli, _)  in enumerate(_TRANSITION_TABLE)}
 
 # Overlay font sizes
 LABEL_FONT_SIZE = 36
@@ -65,14 +80,13 @@ TEXT_OUTLINE_PX = 2
 
 
 # -----------------------------------------------------------------------------
-# Default session state  (reset on S/R; restored on L)
+# Default session state  (reset on S/R; restored on C)
 # -----------------------------------------------------------------------------
 
 SESSION_DEFAULTS: dict = {
-    'random_order':        False,
     'transition_mode':     1,       # 0=Direct 1=Fade-over 2=Fade-out/in
     'current_image_index': 0,
-    'random_seed':         None,
+    'random_seed':         None,    # None = sequential; non-None = random with this seed
     'paused':              False,
     'show_label':          False,
 }
@@ -84,6 +98,7 @@ SESSION_DEFAULTS: dict = {
 
 SETTINGS_DEFAULTS: dict = {
     'image_delay':                      5,       # seconds each image is shown
+    'transition_mode':                  1,       # default for new sessions: 0=Direct 1=Fade-over 2=Fade-out/in
     'transition_time_fade_over':        2,       # seconds for fade-over transition
     'transition_time_fade_out_fade_in': 2,       # seconds for fade-out/in transition
     'background_color':                 '#000000',
@@ -159,14 +174,9 @@ def discover_images(target_dir: Path) -> list[Path]:
 
 def build_playlist(image_files: list[Path], state: dict) -> list[Path]:
     """Return image_files in sequential or reproducibly-random order."""
-    if not state['random_order']:
-        return list(image_files)
-
     seed = state.get('random_seed')
     if seed is None:
-        seed = random.randint(0, 2 ** 31 - 1)
-        state['random_seed'] = seed          # Persist so the same order is resumed
-
+        return list(image_files)
     rng = random.Random(seed)
     playlist = list(image_files)
     rng.shuffle(playlist)
@@ -515,8 +525,6 @@ def pick_display() -> int | None:
     """
     num = pygame.display.get_num_displays()
     if num <= 1:
-        w, h = pygame.display.get_desktop_sizes()[0]
-        print(f"Display 1 ({w}x{h}) - only display detected.")
         return 0
 
     sizes   = pygame.display.get_desktop_sizes()   # list of (w, h), one per display
@@ -590,7 +598,7 @@ def show_start_menu(screen: pygame.Surface,
                     target_dir: Path) -> str:
     """
     Display the start menu and block until the user presses a valid key.
-    Returns one of: 'S', 'R', 'L', 'QUIT'.
+    Returns one of: 'S', 'R', 'C', 'QUIT'.
 
     Background: the image named in settings['start_menu_image'], cover-scaled.
     Falls back to solid black if the image is missing or unloadable.
@@ -622,7 +630,7 @@ def show_start_menu(screen: pygame.Surface,
         ("[R]", "  Random order"),
     ]
     if has_saved_session:
-        key_lines.append(("[L]", "  Load previous session"))
+        key_lines.append(("[C]", "  Continue session"))
 
     # Pre-render to measure widths for block-centering
     ACCENT = (255, 220, 80)
@@ -647,11 +655,12 @@ def show_start_menu(screen: pygame.Surface,
     SEP_GAP   = 16   # gap above/below the separator line
     ROW_GAP   = 14   # extra gap between key lines
     NOTE_GAP  = 20   # gap above the note line
+    DIV_GAP   = ROW_GAP if has_saved_session else 0   # extra space for the S/R | C divider
 
     inner_w = max(title_surf.get_width(), max_line_w,
                   note_surf.get_width() if note_surf else 0)
     inner_h = (title_surf.get_height() + SEP_GAP * 2 + 1 +   # title + separator
-               len(key_lines) * (line_h + ROW_GAP) - ROW_GAP +
+               len(key_lines) * (line_h + ROW_GAP) - ROW_GAP + DIV_GAP +
                ((NOTE_GAP + font_note.get_height()) if note_surf else 0))
 
     panel_w = inner_w + BOX_PAD * 2
@@ -687,7 +696,13 @@ def show_start_menu(screen: pygame.Surface,
         block_x = panel_x + (panel_w - max_line_w) // 2
         ky = sep_y + SEP_GAP
 
-        for ks, ds in zip(key_surfs, desc_surfs):
+        for i, (ks, ds) in enumerate(zip(key_surfs, desc_surfs)):
+            if has_saved_session and i == len(key_surfs) - 1:
+                div_y = ky + DIV_GAP // 2
+                pygame.draw.line(screen, (80, 80, 80),
+                                 (block_x, div_y),
+                                 (block_x + max_line_w, div_y), 1)
+                ky += DIV_GAP
             screen.blit(ks, (block_x, ky))
             screen.blit(ds, (block_x + ks.get_width(), ky))
             ky += line_h + ROW_GAP
@@ -704,7 +719,7 @@ def show_start_menu(screen: pygame.Surface,
     # -- Event loop
     valid = {pygame.K_r: 'R', pygame.K_s: 'S'}
     if has_saved_session:
-        valid[pygame.K_l] = 'L'
+        valid[pygame.K_c] = 'C'
 
     while True:
         for event in pygame.event.get():
@@ -909,13 +924,33 @@ def run_slideshow(screen: pygame.Surface,
 # -----------------------------------------------------------------------------
 
 def main() -> None:
-    # -- Argument and directory validation
-    if len(sys.argv) < 2:
-        print("Error: No target directory specified.")
-        print("Usage: python memoir.py <directory>")
-        sys.exit(1)
+    # -- Argument parsing
+    parser = argparse.ArgumentParser(
+        prog='memoir',
+        description='Fullscreen image slideshow with fade transitions and session persistence.'
+    )
+    parser.add_argument('directory',
+                        help='Directory containing images to display')
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--order', choices=['sequential', 'random'],
+                            metavar='sequential|random',
+                            help='Start in the given order, skipping the start menu')
+    mode_group.add_argument('--continue', dest='resume', action='store_true',
+                            help='Continue a previously saved session, skipping the start menu')
+    parser.add_argument('--display', type=int, metavar='N',
+                        help='Display number, 1-based (skips the display picker)')
+    parser.add_argument('--delay', type=float, metavar='SECONDS',
+                        help='Image duration in seconds (overrides settings file)')
+    _tc = [cli for cli, _ in _TRANSITION_TABLE]
+    parser.add_argument('--transition', choices=_tc,
+                        metavar='|'.join(_tc),
+                        help='Transition style (overrides settings file)')
+    parser.add_argument('--windowed', action='store_true',
+                        help='Run as a borderless window instead of exclusive fullscreen')
+    args = parser.parse_args()
 
-    target_dir = Path(sys.argv[1])
+    # -- Directory and argument validation
+    target_dir = Path(args.directory)
 
     if not target_dir.exists():
         print(f"Error: Path does not exist: '{target_dir}'")
@@ -925,6 +960,9 @@ def main() -> None:
         sys.exit(1)
     if not os.access(target_dir, os.R_OK):
         print(f"Error: Directory is not readable: '{target_dir}'")
+        sys.exit(1)
+    if args.delay is not None and args.delay <= 0:
+        print("Error: --delay must be a positive number.")
         sys.exit(1)
 
     image_files = discover_images(target_dir)
@@ -947,18 +985,40 @@ def main() -> None:
             settings['start_menu_image'] = image_files[0].name
         save_settings(settings, target_dir)
 
+    # CLI wins over settings file for the current run.
+    if args.delay is not None:
+        settings['image_delay'] = args.delay
+    if args.transition is not None:
+        settings['transition_mode'] = TRANSITION_CLI[args.transition]
+
     # -- Pygame initialisation
     pygame.init()
 
-    display_idx = pick_display()
-    if display_idx is None:
-        pygame.quit()
-        return   # User cancelled the display picker
+    # -- Display selection
+    num_displays = pygame.display.get_num_displays()
+    if args.display is not None:
+        if not (1 <= args.display <= num_displays):
+            print(f"Error: --display {args.display} is out of range "
+                  f"({num_displays} display(s) found).")
+            pygame.quit()
+            sys.exit(1)
+        display_idx = args.display - 1
+    else:
+        display_idx = pick_display()
+        if display_idx is None:
+            pygame.quit()
+            return   # User cancelled the display picker
 
     disp_w, disp_h = pygame.display.get_desktop_sizes()[display_idx]
-    print(f"Display {display_idx + 1} ({disp_w}x{disp_h}).")
+    if num_displays == 1 and args.display is None:
+        print(f"Display 1 ({disp_w}x{disp_h}) - only display detected.")
+    else:
+        print(f"Display {display_idx + 1} ({disp_w}x{disp_h}).")
 
-    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN, display=display_idx)
+    if args.windowed:
+        screen = pygame.display.set_mode((disp_w, disp_h), pygame.NOFRAME, display=display_idx)
+    else:
+        screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN, display=display_idx)
     pygame.display.set_caption("Memoir")
     pygame.mouse.set_visible(False)
 
@@ -966,28 +1026,42 @@ def main() -> None:
     state: dict | None = None   # guards the finally-block save; None means no session was started
 
     try:
-        choice = show_start_menu(screen,
-                                 has_saved_session=saved_session is not None,
-                                 settings=settings,
-                                 target_dir=target_dir)
+        # -- Start mode: use flags directly or show the interactive menu
+        if args.order is not None:
+            choice = 'S' if args.order == 'sequential' else 'R'
+        elif args.resume:
+            if saved_session is None:
+                print("No session found - starting sequential.")
+                choice = 'S'
+            else:
+                choice = 'C'
+        else:
+            choice = show_start_menu(screen,
+                                     has_saved_session=saved_session is not None,
+                                     settings=settings,
+                                     target_dir=target_dir)
 
         if choice == 'QUIT':
             return
 
         # Build session state
-        if choice == 'L' and saved_session is not None:
+        if choice == 'C' and saved_session is not None:
             state = saved_session
-            print(f"Resumed session: image {state['current_image_index'] + 1}, "
-                  f"{'random' if state['random_order'] else 'sequential'}, "
+            if args.transition is not None:   # CLI beats saved session
+                state['transition_mode'] = settings['transition_mode']
+            print(f"Continued session: image {state['current_image_index'] + 1}, "
+                  f"{'random' if state.get('random_seed') is not None else 'sequential'}, "
                   f"transition: {TRANSITION_NAMES[state['transition_mode']]}.")
         else:
             state = SESSION_DEFAULTS.copy()
-            state['random_order'] = (choice == 'R')
+            if choice == 'R':
+                state['random_seed'] = random.randint(0, 2 ** 31 - 1)
+            state['transition_mode'] = settings['transition_mode']
 
         playlist = build_playlist(image_files, state)
 
-        if choice != 'L':
-            mode = 'random' if state['random_order'] else 'sequential'
+        if choice != 'C':
+            mode = 'random' if state.get('random_seed') is not None else 'sequential'
             print(f"Starting slideshow: {len(playlist)} images, {mode}, "
                   f"{settings['image_delay']}s per image, "
                   f"transition: {TRANSITION_NAMES[state['transition_mode']]}.")
