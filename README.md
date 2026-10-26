@@ -1,6 +1,6 @@
 # Memoir
 
-_In memory of Dad: 1946-08-02 — 2026-02-06_
+_In memory of Dad: 1942-11-05 — 2026-02-06_
 
 A single-file Python slideshow — simple enough for a party, reliable enough to leave unattended. No install, no account, no nag screen.
 
